@@ -7,7 +7,7 @@ I tried out one or two online whiteboard websites and there were some things I d
 * There's no way of knowing if a message has been received, so when I draw something I don't know when they can see it.
 * There's no indication of the size of their screen, so I was accidentally writing outside of their viewing window a lot.
 * I prefer a "lasso"-style erase, so that erasing large areas is quick and easy.
-* There's no way to point to or highlight a particular thing temporarily, so I'd end up drawing arrows to things and then erasing them later, which was annoying.
+* There's no way to point to or highlight a particular thing temporarily (e.g. when you want to say '*this* side of the triangle' or '*this* coefficient'), so I'd end up drawing arrows to things and then having to erase them later, which was annoying.
 
 So I decided to write my own whiteboard program with the following features:
 * Middle-click pastes in the last png file created from my home directory (which is where screenshots go on my computer).
@@ -22,10 +22,10 @@ I wrote this for linux, so I used GTK, which can be a bit of a pain to get worki
 
 You'll need python3 and may need to install some packages with pip, e.g. `pip3 install websockets`.
 
-You'll also need a website. The student visits a web page which tells their browser the ip address and port to use for the websockets connection to your computer. Since I don't have a static ip address, I decided to make a little script which can be launched from the websketch program to save my current ip address on the server ([storeip.sh](https://github.com/jennigorham/websketch/blob/master/storeip.sh)), and then that address is retrieved by [index.php](https://github.com/jennigorham/websketch/blob/master/index.php). If you don't have any experience with web development and all this is confusing, you might find it easier to just upload the static version, [index.html](https://github.com/jennigorham/websketch/blob/master/index.html) to your web server, and edit it if your ip address changes.
+You'll also need a website. The student visits a web page which tells their browser the ip address and port to use for the websockets connection to your computer. Since I don't have a static ip address, I decided to make a little script which can be launched from the websketch program to save my current ip address on the server ([storeip.sh](https://github.com/jennigorham/websketch/blob/master/storeip.sh)), and then that address is retrieved by [index.php](https://github.com/jennigorham/websketch/blob/master/index.php). If you don't have any experience with web development and all this is confusing (or you don't have SSH access to the web server), you might find it easier to just upload the static version, [index.html](https://github.com/jennigorham/websketch/blob/master/index.html) to your web server, and edit it if your ip address changes.
 
 The setup on my web server goes something like this:
-* [storeip.sh](https://github.com/jennigorham/websketch/blob/master/storeip.sh) goes in ~/bin/
+* [storeip.sh](https://github.com/jennigorham/websketch/blob/master/storeip.sh) goes in ~/bin/ (you may need to make it executable with `chmod a+x ~/bin/storeip.sh`).
 * Create the directory ~/data/ - this is where storeip.sh stores the ip address and port.
 * [index.php](https://github.com/jennigorham/websketch/blob/master/index.php) and [script.js](https://github.com/jennigorham/websketch/blob/master/script.js) go in ~/html/websketch/
 
