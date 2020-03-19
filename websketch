@@ -1,0 +1,523 @@
+#!/usr/bin/python3
+
+import gi
+gi.require_version('Gtk', '3.0')
+from gi.repository import Gtk, Gdk, GLib
+import cairo
+import os,datetime
+
+import threading
+import asyncio
+import websockets
+import json
+import base64
+import io
+import resource
+import copy
+
+port = 8765 #port to use for the websocket connection. You'll need to set up port forwarding (aka virtual server) with your router or vpn
+update_server_command = 'ssh <server url goes here> bin/storeip.sh ' + str(port) + ' &' #command that tells your web server what IP address and port this computer is using
+get_image_filename_command = 'ls -c ~/*.png | head -n 1' #when the middle mouse button is pressed, the png file specified by this command will be pasted at the current mouse location. I've gone for a command that points to the last modified png file in my home directory; you might want to change it to something else
+
+#dimensions of the drawing area
+width = 2000
+height = 2000
+
+scroll = 0
+xscroll = 0
+
+window = None
+surface = None
+cr = None
+hi_surface = None
+hi_cr = None
+hi_on = False
+last_x = 0
+last_y = 0
+
+drawing = 0 #0: idle, 1: drawing a line, 2: erasing, 3: about to erase, 4: highlight
+
+points = [] #points that make up the erase polygon
+ws = {} #dictionary of connected websockets, with their canvas width and height
+msgs = [] #array of messages sent to clients
+my_grey = 0.5 #colour of lines before they are acknowledged by client
+tmp_opacity = 0.7 #opacity of erase area before it's acknowledged by client
+new_client = False #new client has just connected, waiting for confirmation
+my_line_width = 1
+client_num = 1 #number identifying connected client
+
+#Sometimes I like to have faint blue lines going across the page (like in notebooks) so I can keep my writing straight. They only show up in the python window, not in the client's browser. Toggle these on/off by pressing 'l'
+show_lines = False
+line_sep = 40
+line_colour = (0,1,1,0.25) #partially transparent cyan
+
+def my_draw_line(x_i,y_i,x_f,y_f):
+	cr.move_to(x_i + xscroll, y_i + scroll)
+	cr.line_to(x_f + xscroll, y_f + scroll)
+	cr.stroke()
+
+def move(area, event):
+	global last_x, last_y, points
+	with draw_lock:
+		if drawing == 1:
+			my_draw_line(last_x,last_y,event.x,event.y)
+			area.queue_draw_area(int(min(last_x,event.x))-5, int(min(last_y,event.y))-5, int(max(last_x,event.x))+5, int(max(last_y,event.y))+5)
+			last_x = event.x
+			last_y = event.y
+			points.append((int(event.x) + xscroll,int(event.y) + scroll))
+		elif drawing == 2:
+			area.queue_draw()
+			last_x = event.x
+			last_y = event.y
+			points.append((int(event.x) + xscroll,int(event.y) + scroll))
+		elif drawing == 4:
+			hi_cr.move_to(last_x + xscroll, last_y + scroll)
+			hi_cr.line_to(event.x + xscroll, event.y + scroll)
+			hi_cr.stroke()
+			area.queue_draw_area(int(min(last_x,event.x))-5, int(min(last_y,event.y))-5, int(max(last_x,event.x))+5, int(max(last_y,event.y))+5)
+			last_x = event.x
+			last_y = event.y
+			points.append((int(event.x) + xscroll,int(event.y) + scroll))
+
+def expose(area, cr):
+	dimensions = []
+	with ws_lock:
+		for conn in ws:
+			dimensions.append([ws[conn][0],ws[conn][1]])
+	with draw_lock:
+		tmp_cr = area.get_window().cairo_create()
+		tmp_cr.set_source_surface(surface,-xscroll,-scroll)
+		tmp_cr.paint()
+		if hi_on:
+			tmp_cr.set_source_surface(hi_surface,-xscroll,-scroll)
+			tmp_cr.paint()
+
+		tmp_cr.set_line_width(1)
+
+		if show_lines:
+			start = -scroll % line_sep
+			tmp_cr.set_source_rgba(*line_colour)
+			for i in range(start,1080,line_sep):
+				tmp_cr.move_to(0,i)
+				tmp_cr.line_to(width,i)
+				tmp_cr.stroke()
+
+		tmp_cr.set_source_rgb(0,0,0)
+		tmp_cr.set_dash([5.0,5.0])
+		if drawing == 2 and len(points) > 0:
+			tmp_cr.move_to(points[0][0]-xscroll,points[0][1]-scroll)
+			for point in points[1:]:
+				tmp_cr.line_to(point[0]-xscroll,point[1]-scroll)
+			tmp_cr.line_to(points[0][0]-xscroll,points[0][1]-scroll)
+			tmp_cr.stroke()
+
+		for dim in dimensions:
+			tmp_cr.move_to(dim[0]-xscroll,0)
+			tmp_cr.line_to(dim[0]-xscroll,dim[1]-scroll)
+			tmp_cr.line_to(0,dim[1]-scroll)
+			tmp_cr.stroke()
+
+		if new_client: #new client has just connected, fade the window to show they haven't yet received the current image
+			tmp_cr.set_source_rgba(1,1,1,tmp_opacity)
+			tmp_cr.rectangle(0,0,width,height)
+			tmp_cr.fill()
+		return False
+
+def clear():
+	cr.set_source_rgba(1,1,1,1)
+	cr.rectangle(0,0,width,height)
+	cr.fill()
+	hi_cr.set_source_rgba(1,1,1,0)
+	hi_cr.rectangle(0,0,width,height)
+	hi_cr.fill()
+
+def send_clear():
+	with draw_lock:
+		if len(ws) > 0:
+			cr.set_source_rgba(1,1,1,tmp_opacity)
+		else:
+			cr.set_source_rgba(1,1,1,1)
+		cr.rectangle(0,0,width,height)
+		cr.fill()
+		area.queue_draw()
+	send({'id': len(msgs), 'mode': 'clear'})
+
+def draw_polygon(pts):
+	cr.move_to(pts[0][0],pts[0][1])
+	for point in pts[1:]:
+		cr.line_to(point[0],point[1])
+	cr.close_path()
+	cr.fill()
+
+def press(area, event):
+	global last_x, last_y, drawing, points, scroll, xscroll
+
+	with draw_lock:
+		if (event.button == 1): #left-click
+			if hi_on: #highlight
+				drawing = 4
+				#clear any previous highlight
+				hi_cr.set_operator(cairo.OPERATOR_CLEAR)
+				hi_cr.rectangle(0,0,width,height)
+				hi_cr.fill()
+				hi_cr.set_operator(cairo.OPERATOR_OVER)
+				area.queue_draw()
+
+				hi_cr.set_source_rgba(my_grey,0,0,0.5)
+				points = [[int(event.x)+xscroll,int(event.y)+scroll]]
+				last_x = event.x
+				last_y = event.y
+			elif drawing == 3: #erase key was pressed
+				last_x = event.x
+				last_y = event.y
+				drawing = 2
+				points = []
+			else:
+				cr.set_source_rgba(my_grey,my_grey,my_grey,1)
+				drawing = 1
+				points = [[int(event.x)+xscroll,int(event.y)+scroll]]
+				last_x = event.x
+				last_y = event.y
+
+		elif (event.button == 2): #middle-click = paste image
+			filename = os.popen(get_image_filename_command).read().strip()
+			img = cairo.ImageSurface.create_from_png(filename)
+			w = img.get_width()
+			h = img.get_height()
+			x = event.x + xscroll
+			y = event.y + scroll
+
+			cr.set_source_surface(img, x, y)
+			cr.paint()
+
+			#draw temporary border to indicate the img hasn't been received by the client yet
+			cr.set_source_rgba(0,0,0,1)
+			cr.set_dash([5.0,5.0])
+			cr.move_to(x,y)
+			cr.line_to(x+w,y)
+			cr.line_to(x+w,y+h)
+			cr.line_to(x,y+h)
+			cr.line_to(x,y)
+			cr.stroke()
+			cr.set_dash([])
+
+			area.queue_draw()
+			with open(filename, "rb") as imageFile:
+				s = base64.b64encode(imageFile.read()).decode('utf-8')
+				send({'id': len(msgs), 'mode': 'png', 'img': s, 'x': x, 'y': y, 'w': w, 'h': h})
+			points = []
+		elif (event.button == 3): #right-click = erase
+			last_x = event.x
+			last_y = event.y
+			drawing = 2
+			points = []
+
+def confirm(m): #this is called when a client confirms receipt of a message
+	if m['mode'] == 'draw':
+		cr.set_source_rgba(0,0,0,1)
+		points = m['points']
+		for i in range(1,len(points)):
+			my_draw_line(points[i-1][0]-xscroll,points[i-1][1]-scroll,points[i][0]-xscroll,points[i][1]-scroll)
+	elif m['mode'] == 'highlight':
+		hi_cr.set_source_rgba(my_grey,0,0,1)
+		points = m['points']
+		for i in range(1,len(points)):
+			hi_cr.move_to(points[i-1][0], points[i-1][1])
+			hi_cr.line_to(points[i][0], points[i][1])
+			hi_cr.stroke()
+	elif m['mode'] == 'erase':
+		cr.set_source_rgba(1,1,1,1)
+		points = m['points']
+		draw_polygon(points)
+	elif m['mode'] == 'png':
+		#destroy the dashed border
+		cr.set_source_rgba(1,1,1,1)
+		cr.set_line_width(2*my_line_width)
+		cr.move_to(m['x'],m['y'])
+		cr.line_to(m['x']+m['w'],m['y'])
+		cr.line_to(m['x']+m['w'],m['y']+m['h'])
+		cr.line_to(m['x'],m['y']+m['h'])
+		cr.line_to(m['x'],m['y'])
+		cr.stroke()
+		cr.set_line_width(my_line_width)
+
+		#redraw the image
+		png_file = io.BytesIO(base64.b64decode(m['img']))
+		img = cairo.ImageSurface.create_from_png(png_file)
+		cr.set_source_surface(img, m['x'], m['y'])
+		cr.paint()
+
+	elif m['mode'] == 'clear':
+		cr.set_source_rgba(1,1,1,1)
+		cr.rectangle(0,0,width,height)
+		cr.fill()
+	elif m['mode'] == 'end_highlight':
+		area.get_window().set_cursor(Gdk.Cursor(Gdk.CursorType.PENCIL))
+
+def confirm_all(): #confirm all messages since last clear (e.g. make all lines drawn look solid)
+	with msg_lock:
+		i = len(msgs)-1
+		while i >= 0:
+			if msgs[i]['mode'] == 'clear':
+				break
+			i -= 1
+		msgs_copy = copy.deepcopy(msgs[i+1:]) #I did this to avoid nesting the locks but I'm not sure if it's necessary
+	with draw_lock:
+		for m in msgs_copy:
+			if m['mode'] != 'highlight':
+				confirm(m)
+
+def get_img(): #save an image of the whiteboard as a string to send to client
+	global new_client
+	#write into temporary file-like object so we can read it and base64ify it
+	tmp_img = io.BytesIO()
+	with draw_lock:
+		surface.write_to_png(tmp_img)
+	tmp_img.seek(0)
+	s = base64.b64encode(tmp_img.read()).decode('utf-8')
+	tmp_img.close()
+
+	new_client = True
+	GLib.idle_add(area.queue_draw)
+
+	return s
+
+#"refresh" ensures that a client's whiteboard matches ours, by sending them an image of ours.
+#This is triggered when a new client connects, and can be manually triggered by pressing 'r' which is useful e.g. if a message doesn't make it to the client, or after undo
+async def refresh(websocket):
+	confirm_all()
+	s = get_img()
+	await websocket.send(json.dumps({"png": s}))
+
+async def refresh_all():
+	confirm_all()
+	s = get_img()
+	with ws_lock:
+		for conn in ws:
+			await conn.send(json.dumps({"png": s}))
+
+async def client_draw(coords,websocket): #have received a path to draw from a client, so draw it
+	with msg_lock:
+		msgs.append({'id': len(msgs), 'mode': 'draw', 'points': coords})
+	#send it to all the other clients
+	with ws_lock:
+		for conn in ws:
+			if conn != websocket:
+				await conn.send(json.dumps(msgs[-1]))
+	with draw_lock:
+		confirm(msgs[-1]) #this draws it on the screen
+
+async def consumer_handler(websocket, path):
+	global ws,new_client,client_num
+	with ws_lock:
+		ws[websocket] = [width,height]
+	num = client_num
+	client_num += 1
+	addr = websocket.remote_address
+	print("Client %d connected from %s:%d, sending png" % (num,addr[0],addr[1]))
+	await refresh(websocket) #send the png
+	print("Memory usage: {:.0f}M".format(resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024)) 
+	try:
+		while True:
+			message = await websocket.recv()
+			msg = json.loads(message)
+			if "width" in msg and "height" in msg:
+				with ws_lock:
+					cur_dim = ws[websocket]
+					#if they resize their window then they won't have whatever was outside their window, so resend it
+					if msg["width"] > ws[websocket][0] or msg["height"] > ws[websocket][1]:
+						await refresh(websocket)
+					ws[websocket] = [ msg["width"], msg["height"] ]
+			elif "id" in msg:
+				m = None
+				with msg_lock:
+					m = msgs[msg['id']].copy() #I did this to avoid nesting the locks. not sure if necessary
+				with draw_lock:
+					confirm(m)
+			elif "confirmall" in msg:
+				new_client = False
+			elif "draw" in msg:
+				await client_draw(msg["draw"],websocket)
+			else:
+				print(msg)
+			GLib.idle_add(area.queue_draw) #area.queue_draw isn't thread safe, and if you don't have the idle_add bit then this might end up editing the draw queue while gtk is accessing it and gtk will freeze without any error messages and this took me ages to diagnose.
+	except websockets.exceptions.ConnectionClosed:
+		print('(' + str(num) + ') Connection closed')
+	except ConnectionResetError:
+		print('(' + str(num) + ') Connection reset by peer')
+	except TimeoutError:
+		print('(' + str(num) + ') Timeout')
+	finally:
+		print('Removing client ' + str(num) + ' from list of websockets')
+		with ws_lock:
+			del ws[websocket]
+		GLib.idle_add(area.queue_draw)
+
+def send(j):
+	with msg_lock:
+		msgs.append(j)
+	with ws_lock:
+		for conn in ws:
+			asyncio.run_coroutine_threadsafe(conn.send(json.dumps(j)), asyncio.get_event_loop())
+
+def release(area, event):
+	global drawing,points
+	mode = 'draw'
+	with draw_lock:
+		if drawing == 2:
+			mode = 'erase'
+			cr.set_source_rgba(1,1,1,tmp_opacity)
+			draw_polygon(points)
+			area.queue_draw()
+			area.get_window().set_cursor(Gdk.Cursor(Gdk.CursorType.PENCIL))
+		elif drawing == 4:
+			mode = 'highlight'
+		drawing = 0
+		if (len(points) > 0):
+			send({'id': len(msgs), 'mode': mode, 'points': points})
+
+def undo():
+	#clear the whiteboard, then repeat all drawing/erase/paste commands (except the last one) since the last clear
+	#the client is not automatically updated on this. Use 'r' to refresh their screen once you've undone everything you want to
+	with draw_lock:
+		clear()
+	with msg_lock:
+		msgs.pop()
+		i = len(msgs)-1
+		while i >= 0:
+			if msgs[i]['mode'] == 'clear':
+				break
+			i -= 1
+		msgs_copy = copy.deepcopy(msgs[i+1:])
+	with draw_lock:
+		for m in msgs_copy:
+			if m['mode'] != 'highlight':
+				confirm(m)
+		area.queue_draw()
+
+def key(area, event):
+	global scroll,xscroll,drawing,hi_on,show_lines
+	keyname = Gdk.keyval_name(event.keyval)
+	with draw_lock:
+		if keyname == 'e': #e: erase
+			if drawing == 3:
+				area.get_window().set_cursor(Gdk.Cursor(Gdk.CursorType.PENCIL))
+				drawing = 0
+			elif drawing == 0:
+				area.get_window().set_cursor(Gdk.Cursor(Gdk.CursorType.CROSS))
+				drawing = 3
+		elif keyname == 'l': #l: toggle lines
+			show_lines = not show_lines
+			area.queue_draw_area(0,0,width,height)
+		elif keyname == 'j': #j: scroll down
+			scroll += 10
+			area.queue_draw()
+		elif keyname == 'k': #k: scroll up
+			scroll = max(0,scroll-10)
+			area.queue_draw()
+		elif keyname == 'Page_Down':
+			scroll += int(window.get_size().height * 0.9)
+			area.queue_draw_area(0,0,width,height)
+		elif keyname == 'Page_Up':
+			scroll -= int(window.get_size().height * 0.9)
+			if scroll < 0:
+				scroll = 0
+			area.queue_draw_area(0,0,width,height)
+
+	#parts that don't need a draw_lock
+	if keyname == 's': #s: store ip address
+		print("Storing IP address and port...")
+		os.system(update_server_command)
+	elif keyname == 'z': #z: undo
+		undo()
+	elif keyname == 'c': #c: clear screen
+		send_clear()
+	elif keyname == 'h': #h: highlight
+		if hi_on:
+			hi_on = False
+			if len(ws) > 0:
+				area.get_window().set_cursor(Gdk.Cursor(Gdk.CursorType.WATCH))
+			else:
+				area.get_window().set_cursor(Gdk.Cursor(Gdk.CursorType.PENCIL))
+			send({'id': len(msgs), 'mode': 'end_highlight'})
+			area.queue_draw()
+		else:
+			area.get_window().set_cursor(Gdk.Cursor(Gdk.CursorType.SPIDER))
+			with draw_lock:
+				hi_cr.set_operator(cairo.OPERATOR_CLEAR)
+				hi_cr.rectangle(0,0,width,height)
+				hi_cr.fill()
+				hi_cr.set_operator(cairo.OPERATOR_OVER)
+				hi_on = True
+	elif keyname == 'r': #r: resend png
+		asyncio.run_coroutine_threadsafe(refresh_all(), asyncio.get_event_loop())
+
+def myscroll(area, event):
+	global scroll,xscroll
+	with draw_lock:
+		if event.direction == Gdk.ScrollDirection.UP:
+			scroll = max(0,scroll-10)
+			area.queue_draw()
+		elif event.direction == Gdk.ScrollDirection.DOWN:
+			scroll += 10
+			area.queue_draw()
+		elif event.direction == Gdk.ScrollDirection.LEFT and xscroll > 10:
+			xscroll = max(0,xscroll-10)
+			area.queue_draw()
+		elif event.direction == Gdk.ScrollDirection.RIGHT:
+			xscroll += 10
+			area.queue_draw()
+
+def quit(widget):
+	Gtk.main_quit()
+
+window = Gtk.Window(Gtk.WindowType.TOPLEVEL)
+window.set_title("WebSketch")
+window.connect("destroy", quit)
+
+area = Gtk.DrawingArea()
+area.connect("motion_notify_event", move)
+area.connect("button_press_event", press)
+area.connect("button_release_event", release)
+area.connect("key_press_event", key)
+area.connect("scroll_event", myscroll)
+
+area.set_events(Gdk.EventMask.EXPOSURE_MASK
+   			| Gdk.EventMask.KEY_PRESS_MASK
+   			| Gdk.EventMask.BUTTON_PRESS_MASK
+   			| Gdk.EventMask.BUTTON_RELEASE_MASK
+   			| Gdk.EventMask.POINTER_MOTION_MASK
+   			| Gdk.EventMask.SCROLL_MASK
+   			| Gdk.EventMask.POINTER_MOTION_HINT_MASK)
+
+window.add(area)
+area.connect("draw", expose)
+
+surface = cairo.ImageSurface(cairo.FORMAT_RGB24,width,height)
+cr = cairo.Context(surface)
+cr.set_line_width(my_line_width)
+hi_surface = cairo.ImageSurface(cairo.FORMAT_ARGB32,width,height)
+hi_cr = cairo.Context(hi_surface)
+hi_cr.set_line_width(my_line_width)
+clear()
+
+
+area.show()
+window.show()
+
+area.set_can_focus(True)
+area.grab_focus()
+
+ws_lock = threading.Lock()
+draw_lock = threading.Lock()
+msg_lock = threading.Lock()
+
+start_server = websockets.serve(consumer_handler, '', port)
+
+asyncio.get_event_loop().run_until_complete(start_server)
+wst = threading.Thread(target=asyncio.get_event_loop().run_forever)
+wst.daemon = True
+wst.name = 'websocket'
+wst.start()
+
+Gtk.main()
